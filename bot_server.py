@@ -1,0 +1,102 @@
+import os
+from flask import Flask, request, jsonify
+import requests
+
+app = Flask(__name__)
+
+API_KEY = "4cdf16a5e34a44ba806d6a4bbfa03f4a"
+BASE_URL = "https://open-api-v4.coinglass.com"
+
+def fetch_coinglass_liquidation_map(raw_symbol):
+    clean_symbol = raw_symbol.split(':')[-1].upper()
+    clean_symbol = clean_symbol.replace("USDT", "").replace("BUSD", "").replace("PERP", "").replace(".P", "")
+    
+    endpoint = "/api/futures/liquidation/aggregated-map"
+    url = f"{BASE_URL}{endpoint}"
+    
+    params = {
+        "symbol": clean_symbol,
+        "range": "1d"
+    }
+    
+    headers = {
+        "accept": "application/json",
+        "coinglassSecret": API_KEY
+    }
+    
+    try:
+        print(f"🔄 Đang gọi Coinglass API tự động cho mã: {clean_symbol}...")
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if str(result.get("code")) == "0":
+                return clean_symbol, result.get("data", {})
+    except Exception as e:
+        print(f"❌ Lỗi kết nối Coinglass API: {str(e)}")
+    
+    return clean_symbol, None
+
+def analyze_liquidation_pools(liq_raw_data, current_price):
+    highest_long_vol = 0.0
+    best_long_liq = 0.0
+    highest_short_vol = 0.0
+    best_short_liq = 0.0
+    
+    if not isinstance(liq_raw_data, dict):
+        return 0.0, 0.0
+
+    for price_key, entries in liq_raw_data.items():
+        try:
+            for entry in entries:
+                liq_price = float(entry[0])
+                liq_vol = float(entry[1]) if len(entry) > 1 and entry[1] is not None else 0.0
+                
+                if liq_price < current_price:
+                    if liq_vol > highest_long_vol:
+                        highest_long_vol = liq_vol
+                        best_long_liq = liq_price
+                elif liq_price > current_price:
+                    if liq_vol > highest_short_vol:
+                        highest_short_vol = liq_vol
+                        best_short_liq = liq_price
+        except (ValueError, TypeError):
+            continue
+            
+    return best_long_liq, best_short_liq
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        data = request.json
+        raw_symbol = data.get('symbol', 'BTCUSDT')
+        current_price = float(data.get('price', 0.0))
+        
+        print(f"\n🔔 Nhận tín hiệu | Ticker: {raw_symbol} | Giá: {current_price}")
+        
+        clean_symbol, liq_data = fetch_coinglass_liquidation_map(raw_symbol)
+        
+        if liq_data and current_price > 0:
+            best_long_liq, best_short_liq = analyze_liquidation_pools(liq_data, current_price)
+            
+            print(f"✅ [SUCCESS {clean_symbol}] Long Liq: {best_long_liq} | Short Liq: {best_short_liq}")
+            
+            return jsonify({
+                "status": "success",
+                "symbol": clean_symbol,
+                "target_long_liquidation": best_long_liq,
+                "target_short_liquidation": best_short_liq
+            }), 200
+        else:
+            return jsonify({"status": "error", "message": "Không lấy được dữ liệu Coinglass"}), 400
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def home():
+    return "Bot Server is running!", 200
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
